@@ -6,19 +6,32 @@
  */
 
 import { EvidenceType } from "@evidence-dev/db-commons";
+import Stripe from 'stripe';
 
 /**
  * @see https://docs.evidence.dev/plugins/create-source-plugin/#options-specification
  * @see https://github.com/evidence-dev/evidence/blob/main/packages/postgres/index.cjs#L316
  */
 export const options = {
-  SomeOption: {
-    title: "Some Option",
-    description:
-      "This object defines how SomeOption should be displayed and configured in the Settings UI",
-    type: "string", // options: 'string' | 'number' | 'boolean' | 'select' | 'file'
-  },
+  apiKey: {
+    title: "Stripe API Key",
+    description: "Your Stripe secret API key",
+    type: "string",
+    required: true,
+    secret: true
+  }
 };
+
+function stringifyNestedObjects(obj) {
+  return Object.fromEntries(
+    Object.entries(obj).map(([key, value]) => {
+      if (typeof value === 'object' && value !== null) {
+        return [key, JSON.stringify(value)];
+      }
+      return [key, value];
+    })
+  );
+}
 
 /**
  * Implementing this function creates a "file-based" connector
@@ -30,76 +43,75 @@ export const options = {
  * @see https://docs.evidence.dev/plugins/create-source-plugin/
  * @type {import("@evidence-dev/db-commons").GetRunner<ConnectorOptions>}
  */
-export const getRunner = (options) => {
-  console.debug(`SomeOption = ${options.SomeOption}`);
-
-  // This function will be called for EVERY file in the sources directory
-  // If you are expecting a specific file type (e.g. SQL files), make sure to filter
-  // to exclude others.
-
-  // If you are using some local database file (e.g. a sqlite or duckdb file)
-  // You may also need to filter that file out as well
-  return async (queryText, queryPath) => {
-    // Note: add your logic to process each file queryText and/or queryPath here
-    // ...
-    
-    // Example output, delete or modify as needed
-    const output = {
-      rows: [
-        { someInt: 1, someString: "string" },
-        { someInt: 2, someString: "string2" },
-      ],
-      columnTypes: [
-        {
-          name: "someInt",
-          evidenceType: EvidenceType.NUMBER,
-          typeFidelity: "inferred",
-        },
-        {
-          name: "someString",
-          evidenceType: EvidenceType.STRING,
-          typeFidelity: "inferred",
-        },
-      ],
-      expectedRowCount: 2,
-    };
-
-    return output;
-  };
+export const getRunner = () => {
+  return () => Promise.resolve();
 };
 
 // Uncomment to use the advanced source interface
 // This uses the `yield` keyword, and returns the same type as getRunner, but with an added `name` and `content` field (content is used for caching)
 // sourceFiles provides an easy way to read the source directory to check for / iterate through files
 // /** @type {import("@evidence-dev/db-commons").ProcessSource<ConnectorOptions>} */
-// export async function* processSource(options, sourceFiles, utilFuncs) {
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: [], // rows can be an array
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
-//   yield {
-//     title: "some_demo_table",
-//     content: "SELECT * FROM some_demo_table", // This is ONLY used for caching
-//     rows: async function* () {}, // rows can be a generator function for returning batches of results (e.g. if an API is paginated, or database supports cursors)
-//     columnTypes: [
-//       {
-//         name: "someInt",
-//         evidenceType: EvidenceType.NUMBER,
-//         typeFidelity: "inferred",
-//       },
-//     ],
-//   };
+export async function* processSource(options, sourceFiles, utilFuncs) {
+  const stripe = new Stripe(options.apiKey, {
+    apiVersion: '2023-10-16'
+  });
 
-//  throw new Error("Process Source has not yet been implemented");
-// }
+  const resources = [
+    { name: 'customers', method: () => stripe.customers.list({ limit: 100 }) },
+    { name: 'charges', method: () => stripe.charges.list({ limit: 100 }) },
+    { name: 'invoices', method: () => stripe.invoices.list({ limit: 100 }) },
+    { name: 'subscriptions', method: () => stripe.subscriptions.list({ limit: 100 }) },
+    { name: 'products', method: () => stripe.products.list({ limit: 100 }) },
+    { name: 'prices', method: () => stripe.prices.list({ limit: 100 }) },
+    { name: 'paymentIntents', method: () => stripe.paymentIntents.list({ limit: 100 }) },
+    { name: 'payouts', method: () => stripe.payouts.list({ limit: 100 }) },
+    { name: 'refunds', method: () => stripe.refunds.list({ limit: 100 }) },
+    { name: 'balanceTransactions', method: () => stripe.balanceTransactions.list({ limit: 100 }) },
+    { name: 'events', method: () => stripe.events.list({ limit: 100 }) },
+    { name: 'disputes', method: () => stripe.disputes.list({ limit: 100 }) },
+  ];
+
+  for (const resource of resources) {
+    try {
+      const data = await resource.method();
+      const flattenedData = data.data.map(stringifyNestedObjects);
+      
+      if (flattenedData.length > 0) {
+        const columnTypes = inferColumnTypes(flattenedData);
+
+        yield {
+          rows: flattenedData,
+          columnTypes: columnTypes,
+          expectedRowCount: flattenedData.length,
+          name: resource.name,
+          content: JSON.stringify({ resource: resource.name, apiKey: options.apiKey.substring(0, 5) + "..." }),
+        };
+      }
+    } catch (error) {
+      console.error(`Error fetching ${resource.name}:`, error);
+    }
+  }
+}
+
+function inferColumnTypes(rows) {
+  if (rows.length === 0) return [];
+
+  const sampleRow = rows[0];
+  return Object.keys(sampleRow).map(key => {
+    let evidenceType = EvidenceType.STRING;
+    if (typeof sampleRow[key] === 'number') {
+      evidenceType = EvidenceType.NUMBER;
+    } else if (sampleRow[key] instanceof Date) {
+      evidenceType = EvidenceType.DATE;
+    }
+
+    return {
+      name: key,
+      evidenceType: evidenceType,
+      typeFidelity: "inferred",
+    };
+  });
+}
 
 /**
  * Implementing this function creates an "advanced" connector
@@ -111,5 +123,12 @@ export const getRunner = (options) => {
 
 /** @type {import("@evidence-dev/db-commons").ConnectionTester<ConnectorOptions>} */
 export const testConnection = async (opts) => {
-  return true;
+  try {
+    const stripe = new Stripe(opts.apiKey);
+    await stripe.customers.list({ limit: 1 });
+    return true;
+  } catch (error) {
+    console.error("Stripe connection test failed:", error);
+    return false;
+  }
 };
