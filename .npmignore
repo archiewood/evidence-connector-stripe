@@ -1,0 +1,4 @@
+run-plugin.sh
+node_modules
+test-app
+plugin-template
